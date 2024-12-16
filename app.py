@@ -6,7 +6,6 @@ import pymssql
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
-import pyodbc
 from azure.storage.blob import BlobServiceClient
 
 # Load environment variables
