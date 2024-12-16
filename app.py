@@ -1,10 +1,13 @@
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
-import pyodbc
-from datetime import datetime
-import logging
-from azure.storage.blob import BlobServiceClient
 import os
+import logging
 from dotenv import load_dotenv
+import pymssql
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+import pyodbc
+from azure.storage.blob import BlobServiceClient
 
 # Load environment variables
 load_dotenv()
@@ -15,34 +18,25 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# SQL Server Connection Configuration
+# Database Connection Configuration
 def get_db_connection():
     try:
         # Retrieve database credentials from environment variables
-        driver = 'ODBC Driver 17 for SQL Server'  # Most compatible driver
         server = os.getenv('DB_SERVER')
         database = os.getenv('DB_DATABASE')
         username = os.getenv('DB_USERNAME')
         password = os.getenv('DB_PASSWORD')
 
-        # Construct connection string
-        conn_str = (
-            f'DRIVER={{{driver}}};'
-            f'SERVER={server};'
-            f'DATABASE={database};'
-            f'UID={username};'
-            f'PWD={password};'
-        )
+        # Create SQLAlchemy engine
+        connection_string = f'mssql+pymssql://{username}:{password}@{server}/{database}'
+        engine = create_engine(connection_string, echo=False)
+        
+        # Create a session factory
+        Session = sessionmaker(bind=engine)
+        return Session()
 
-        # Attempt connection
-        conn = pyodbc.connect(conn_str)
-        return conn
-    except pyodbc.Error as e:
+    except Exception as e:
         logger.error(f"Database connection error: {str(e)}")
-        # Log available drivers for debugging
-        logger.info("Available ODBC drivers:")
-        for driver in pyodbc.drivers():
-            logger.info(f"  - {driver}")
         raise
 
 # Login Route
@@ -52,44 +46,33 @@ def login():
         username = request.form['userName']
         password = request.form['password']
 
-        conn = None
         try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
+            # Use SQLAlchemy session for database operations
+            session = get_db_connection()
+            
+            # Execute query using SQLAlchemy
+            query = text('SELECT userID FROM MobiUser WHERE userName = :username AND password = :password')
+            result = session.execute(query, {'username': username, 'password': password}).fetchone()
+            
+            # Close the session
+            session.close()
 
-            try:
-                # Check if user exists and password matches
-                cursor.execute('SELECT userID FROM MobiUser WHERE userName = ? AND password = ?', (username, password))
-                user = cursor.fetchone()
+            if result:
+                # Successful login
+                return redirect(url_for('dashboard', user_id=result[0]))
+            else:
+                # Invalid credentials
+                return render_template_string(login_page, error='Invalid username or password')
 
-                if user:
-                    # Store user ID in session or pass it as a parameter
-                    return redirect(url_for('dashboard', user_id=user[0]))
-                else:
-                    return "Invalid credentials. Please try again."
-            finally:
-                # Ensure connection is closed
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception as close_error:
-                        logger.error(f"Error closing database connection: {str(close_error)}")
-
-        except pyodbc.Error as db_error:
-            # Specific database-related error handling
-            logger.error(f"Database error: {str(db_error)}")
-            return f"Database error: {str(db_error)}", 500
         except Exception as e:
-            # Catch-all for any other unexpected errors
-            logger.error(f"Unexpected error in login route: {str(e)}", exc_info=True)
-            return f"An unexpected error occurred: {str(e)}", 500
+            logger.error(f"Login query error: {str(e)}")
+            return render_template_string(login_page, error='Database query error')
 
     return render_template_string(login_page)
 
 # Dashboard (to show after successful login)
 @app.route('/dashboard')
 def dashboard():
-    conn = None
     try:
         # Retrieve user ID from query parameter
         user_id = request.args.get('user_id')
@@ -103,27 +86,26 @@ def dashboard():
         logger.info(f"Dashboard accessed for user ID: {user_id}")
         
         # Establish database connection
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        session = get_db_connection()
 
         # Get the current month
         current_month = datetime.now().strftime("%m")
         
         # First, verify if the user exists
-        cursor.execute('SELECT userName FROM MobiUser WHERE userID = ?', (user_id,))
-        user = cursor.fetchone()
+        query = text('SELECT userName FROM MobiUser WHERE userID = :user_id')
+        user = session.execute(query, {'user_id': user_id}).fetchone()
         
         if not user:
             logger.error(f"User with ID {user_id} not found in database")
             return f"User not found", 404
 
         # Fetch routes for the current user and month
-        cursor.execute('''
+        query = text('''
             SELECT DISTINCT routeName 
             FROM mobiRouteScheduleList 
-            WHERE userID = ? AND MONTH = ?
-        ''', (user_id, current_month))
-        routes = cursor.fetchall()
+            WHERE userID = :user_id AND MONTH = :current_month
+        ''')
+        routes = session.execute(query, {'user_id': user_id, 'current_month': current_month}).fetchall()
         
         # Log the number of routes found
         logger.info(f"Found {len(routes)} routes for user ID {user_id}")
@@ -276,6 +258,29 @@ def dashboard():
                     border-radius: 4px;
                     transition: width 0.3s ease;
                 }}
+                #successMessage {{
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    background-color: #4CAF50;  /* Vibrant Green */
+                    color: white;
+                    padding: 15px 25px;
+                    border-radius: 5px;
+                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                    z-index: 1000;
+                    display: none;
+                    animation: slideIn 0.5s ease-out;
+                }}
+                @keyframes slideIn {{
+                    from {{
+                        transform: translateX(100%);
+                        opacity: 0;
+                    }}
+                    to {{
+                        transform: translateX(0);
+                        opacity: 1;
+                    }}
+                }}
             </style>
         </head>
         <body>
@@ -340,7 +345,21 @@ def dashboard():
                 </form>
             </div>
 
+            <div id="successMessage"></div>
+
             <script>
+                // Function to show green success message
+                function showSuccessMessage(message) {{
+                    const messageContainer = document.getElementById('successMessage');
+                    messageContainer.textContent = message;
+                    messageContainer.style.display = 'block';
+                    
+                    // Automatically hide after 3 seconds
+                    setTimeout(() => {{
+                        messageContainer.style.display = 'none';
+                    }}, 3000);
+                }}
+
                 document.getElementById('route').addEventListener('change', function() {{
                     const routeName = this.value;
                     const outletSelect = document.getElementById('outlet');
@@ -374,14 +393,20 @@ def dashboard():
                     .then(response => response.json())
                     .then(data => {{
                         if (data.success) {{
-                            alert('Invoice uploaded successfully!');
+                            // Show green success message
+                            showSuccessMessage('Invoice uploaded successfully!');
+                            
+                            // Reset the form
                             this.reset();
                         }} else {{
-                            alert('Error uploading invoice: ' + data.message);
+                            // Show error message
+                            showSuccessMessage(data.message || 'Error uploading invoice');
                         }}
                     }})
                     .catch(error => {{
-                        alert('Error uploading invoice: ' + error.message);
+                        // Show error message for network or unexpected errors
+                        showSuccessMessage('Failed to upload invoice. Please try again.');
+                        console.error('Error:', error);
                     }});
                 }});
             </script>
@@ -389,101 +414,73 @@ def dashboard():
         </html>
         '''
 
+        # Close the session
+        session.close()
+
         return dashboard_page
 
-    except pyodbc.Error as db_error:
-        # Specific database-related error handling
-        logger.error(f"Database error: {str(db_error)}")
-        return f"Database error: {str(db_error)}", 500
     except Exception as e:
-        # Catch-all for any other unexpected errors
         logger.error(f"Unexpected error in dashboard route: {str(e)}", exc_info=True)
         return f"An unexpected error occurred: {str(e)}", 500
-    finally:
-        # Ensure connection is closed
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception as close_error:
-                logger.error(f"Error closing database connection: {str(close_error)}")
 
 # New route to fetch outlets based on route name
 @app.route('/get_outlets')
 def get_outlets():
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Establish database connection
+        session = get_db_connection()
 
         route_name = request.args.get('routeName')
 
         # Fetch outlets matching the route name
-        cursor.execute('''
+        query = text('''
             SELECT outletName 
             FROM apOutlet 
-            WHERE clientRoute = ?
-        ''', (route_name,))
+            WHERE clientRoute = :route_name
+        ''')
+        outlets = session.execute(query, {'route_name': route_name}).fetchall()
 
-        outlets = [row[0] for row in cursor.fetchall()]
+        # Close the session
+        session.close()
 
-        return jsonify(outlets)
+        return jsonify([outlet[0] for outlet in outlets])
 
-    except pyodbc.Error as db_error:
-        # Specific database-related error handling
-        logger.error(f"Database error: {str(db_error)}")
-        return f"Database error: {str(db_error)}", 500
     except Exception as e:
-        # Catch-all for any other unexpected errors
         logger.error(f"Unexpected error in get_outlets route: {str(e)}", exc_info=True)
         return f"An unexpected error occurred: {str(e)}", 500
-    finally:
-        # Ensure connection is closed
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception as close_error:
-                logger.error(f"Error closing database connection: {str(close_error)}")
 
 # New route to fetch products
 @app.route('/get_products')
 def get_products():
-    conn = None
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # Establish database connection
+        session = get_db_connection()
 
         try:
             # Fetch products for client 79, not deleted
-            cursor.execute('''
+            query = text('''
                 SELECT DISTINCT productDescription 
                 FROM apProduct 
                 WHERE clientID = 79 AND deleted = 0
             ''')
+            products = session.execute(query).fetchall()
 
-            products = [row[0] for row in cursor.fetchall()]
+            # Close the session
+            session.close()
 
-            return jsonify(products)
+            return jsonify([product[0] for product in products])
 
-        except pyodbc.Error as db_error:
-            # Specific database-related error handling
-            logger.error(f"Database error: {str(db_error)}")
-            return f"Database error: {str(db_error)}", 500
         except Exception as e:
-            # Catch-all for any other unexpected errors
             logger.error(f"Unexpected error in get_products route: {str(e)}", exc_info=True)
             return f"An unexpected error occurred: {str(e)}", 500
-    finally:
-        # Ensure connection is closed
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception as close_error:
-                logger.error(f"Error closing database connection: {str(close_error)}")
+
+    except Exception as e:
+        logger.error(f"Unexpected error in get_products route: {str(e)}", exc_info=True)
+        return f"An unexpected error occurred: {str(e)}", 500
 
 # Route to handle invoice upload
 @app.route('/upload_invoice', methods=['POST'])
 def upload_invoice():
-    conn = None
     try:
         # Azure Storage connection string
         connection_string = "DefaultEndpointsProtocol=https;AccountName=ngstore;AccountKey=0kOBlNdR/pnuhQazkYliSE8BOyxm/KelSLaOuvGuMfJWRlQLUH2ZCsDd34skmg2dVq11QxODu12s+AStmuHgAQ==;EndpointSuffix=core.windows.net"
@@ -495,11 +492,22 @@ def upload_invoice():
 
         # Get form data
         user_id = request.form.get('user_id')
+        invoice_file = request.files.get('invoice_file')
+        if not invoice_file or invoice_file.filename == '':
+            logger.error("No file uploaded")
+            return jsonify({'success': False, 'message': 'No invoice file uploaded'}), 400
+
         outlet_name = request.form.get('outlet_name')
+        if not outlet_name:
+            logger.error("No outlet name provided")
+            return jsonify({'success': False, 'message': 'Outlet name is required'}), 400
+
         invoice_date = request.form.get('invoice_date')
         invoice_number = request.form.get('invoice_number')
-        invoice_file = request.files.get('invoice_file')
         
+        # Log received form data for debugging
+        logger.info(f"Received invoice upload data: user_id={user_id}, outlet_name={outlet_name}, invoice_date={invoice_date}, invoice_number={invoice_number}")
+
         # Get quantities for each product
         sensodent_k_fr_75gm = request.form.get('SENSODENT_K_FR_75GM', 0)
         sensodent_kf_cp_75gm = request.form.get('SENSODENT_KF_CP_75GM', 0)
@@ -509,61 +517,92 @@ def upload_invoice():
         sensodent_k_fr_15g = request.form.get('SENSODENT_K_FR_15G', 0)
         kidodent_cavity_shield = request.form.get('KIDODENT_CAVITY_SHIELD', 0)
 
-        if not invoice_file:
-            return jsonify({'success': False, 'message': 'No file uploaded'}), 400
+        # Validate required fields
+        if not all([user_id, invoice_date, invoice_number, invoice_file]):
+            logger.error("Missing required fields for invoice upload")
+            return jsonify({'success': False, 'message': 'Missing required fields'}), 400
 
         # Get outlet code from apOutlet table
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT outletCode FROM apOutlet WHERE outletName = ?', (outlet_name,))
-        outlet_result = cursor.fetchone()
-        outlet_code = outlet_result[0] if outlet_result else None
+        session = get_db_connection()
+        try:
+            query = text('SELECT outletCode FROM apOutlet WHERE outletName = :outlet_name')
+            outlet_result = session.execute(query, {'outlet_name': outlet_name}).fetchone()
+            
+            if not outlet_result:
+                logger.error(f"No outlet code found for outlet name: {outlet_name}")
+                session.close()
+                return jsonify({'success': False, 'message': 'Outlet code not found'}), 400
+            
+            outlet_code = outlet_result[0]
+            logger.info(f"Found outlet code: {outlet_code} for outlet name: {outlet_name}")
 
-        if not outlet_code:
-            return jsonify({'success': False, 'message': 'Outlet code not found'}), 400
+            # Generate filename in the format outletcode_date
+            current_date = datetime.now().strftime('%Y%m%d_%H%M%S')
+            file_extension = os.path.splitext(str(invoice_file.filename))[1] or '.pdf'
+            azure_filename = f"{outlet_code}_{current_date}{file_extension}"
 
-        # Generate filename in the format outletcode_date
-        current_date = datetime.now().strftime('%Y%m%d_%H%M%S')
-        file_extension = os.path.splitext(str(invoice_file.filename))[1] or '.pdf'  # Ensure string and default to .pdf
-        azure_filename = f"{outlet_code}_{current_date}{file_extension}"
+            # Upload file to Azure Blob Storage
+            blob_client = container_client.get_blob_client(azure_filename)
+            file_contents = invoice_file.read()
+            blob_client.upload_blob(file_contents, overwrite=True)
+            logger.info(f"Successfully uploaded file to Azure Blob Storage: {azure_filename}")
 
-        # Upload file to Azure Blob Storage
-        blob_client = container_client.get_blob_client(azure_filename)
-        file_contents = invoice_file.read()
-        blob_client.upload_blob(file_contents, overwrite=True)
+            # Prepare invoice details query
+            insert_query = text('''
+                INSERT INTO InvoiceDetails (
+                    UserID, OutletCode, OutletName, InvoiceAvailable, DisplayType,
+                    InvoiceDate, InvoiceNumber, InvoiceDocument,
+                    SENSODENT_K_FR_75GM, SENSODENT_KF_CP_75GM, SENSODENT_K_FR_125GM,
+                    SENSODENT_KF_CP_125GM, SENSODENT_KF_CP_15G, SENSODENT_K_FR_15G,
+                    KIDODENT_CAVITY_SHIELD
+                ) VALUES (
+                    :user_id, :outlet_code, :outlet_name, :invoice_available, :display_type,
+                    :invoice_date, :invoice_number, :invoice_document,
+                    :sensodent_k_fr_75gm, :sensodent_kf_cp_75gm, :sensodent_k_fr_125gm,
+                    :sensodent_kf_cp_125gm, :sensodent_kf_cp_15g, :sensodent_k_fr_15g,
+                    :kidodent_cavity_shield
+                )
+            ''')
 
-        # Database operations
-        cursor.execute('''
-            INSERT INTO InvoiceDetails (
-                UserID, OutletCode, OutletName, InvoiceAvailable, DisplayType,
-                InvoiceDate, InvoiceNumber, InvoiceDocument,
-                SENSODENT_K_FR_75GM, SENSODENT_KF_CP_75GM, SENSODENT_K_FR_125GM,
-                SENSODENT_KF_CP_125GM, SENSODENT_KF_CP_15G, SENSODENT_K_FR_15G,
-                KIDODENT_CAVITY_SHIELD
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            user_id, outlet_code, outlet_name, True, 'Standard',
-            invoice_date, invoice_number, azure_filename,
-            sensodent_k_fr_75gm, sensodent_kf_cp_75gm, sensodent_k_fr_125gm,
-            sensodent_kf_cp_125gm, sensodent_kf_cp_15g, sensodent_k_fr_15g,
-            kidodent_cavity_shield
-        ))
+            # Execute the insert query
+            session.execute(insert_query, {
+                'user_id': user_id,
+                'outlet_code': outlet_code,
+                'outlet_name': outlet_name,
+                'invoice_available': True,
+                'display_type': 'Standard',
+                'invoice_date': invoice_date,
+                'invoice_number': invoice_number,
+                'invoice_document': azure_filename,
+                'sensodent_k_fr_75gm': sensodent_k_fr_75gm,
+                'sensodent_kf_cp_75gm': sensodent_kf_cp_75gm,
+                'sensodent_k_fr_125gm': sensodent_k_fr_125gm,
+                'sensodent_kf_cp_125gm': sensodent_kf_cp_125gm,
+                'sensodent_kf_cp_15g': sensodent_kf_cp_15g,
+                'sensodent_k_fr_15g': sensodent_k_fr_15g,
+                'kidodent_cavity_shield': kidodent_cavity_shield
+            })
+            
+            # Commit the transaction
+            session.commit()
+            logger.info(f"Successfully inserted invoice details for user {user_id}")
 
-        conn.commit()
-        return jsonify({'success': True, 'message': 'Invoice uploaded successfully'})
+        except Exception as db_error:
+            # Rollback the transaction in case of error
+            session.rollback()
+            logger.error(f"Database error during invoice upload: {str(db_error)}", exc_info=True)
+            return jsonify({'success': False, 'message': f'Database error: {str(db_error)}'}), 500
+        
+        finally:
+            # Always close the session
+            session.close()
+
+        return jsonify({'success': True, 'message': 'Invoice uploaded successfully'}), 200
 
     except Exception as e:
-        logger.error(f"Error uploading invoice: {str(e)}")
-        if conn:
-            conn.rollback()
-        return jsonify({'success': False, 'message': f'Error uploading invoice: {str(e)}'}), 500
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception as close_error:
-                logger.error(f"Error closing database connection: {str(close_error)}")
+        # Log any unexpected errors
+        logger.error(f"Unexpected error in upload_invoice: {str(e)}", exc_info=True)
+        return jsonify({'success': False, 'message': f'Unexpected error: {str(e)}'}), 500
 
 # Security headers
 @app.after_request
@@ -596,7 +635,7 @@ login_page = '''
             background-color: white;
             padding: 30px;
             border-radius: 10px;
-            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
 
         h2 {

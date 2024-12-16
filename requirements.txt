@@ -1,6 +1,7 @@
 flask==3.0.0
-pyodbc==4.0.39
-azure-storage-blob==12.19.0
-logging
-gunicorn
+sqlalchemy==2.0.25
+pymssql==2.2.8
 python-dotenv
+gunicorn
+logging
+azure-storage-blob==12.19.0
