@@ -1,12 +1,13 @@
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
-import logging
+import pyodbc
 from datetime import datetime
+import logging
 from azure.storage.blob import BlobServiceClient
 import os
-import platform
-import pymssql
-import pyodbc
-from connection_error import ConnectionError
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -17,54 +18,32 @@ app = Flask(__name__)
 # SQL Server Connection Configuration
 def get_db_connection():
     try:
-        # Check if running on Linux (Render) or Windows
-        if platform.system() == 'Linux':
-            try:
-                conn = pymssql.connect(
-                    server='103.7.181.119',
-                    database='SimplyAmplify',
-                    user='Yashs',
-                    password='yashshinde$0310$'
-                )
-                logger.info("Successfully connected to database using pymssql")
-                return conn
-            except Exception as pymssql_err:
-                logger.error(f"pymssql connection error: {pymssql_err}")
-                raise ConnectionError(f"Could not connect to database: {pymssql_err}")
-        else:
-            drivers = pyodbc.drivers()
-            logger.info(f"Available ODBC drivers: {drivers}")
-            
-            # Try different SQL Server drivers
-            driver_names = [
-                'ODBC Driver 18 for SQL Server',
-                'ODBC Driver 17 for SQL Server',
-                'SQL Server Native Client 11.0',
-                'SQL Server',
-                'SQL Server Native Client'
-            ]
-            
-            for driver in driver_names:
-                if driver in drivers:
-                    try:
-                        conn = pyodbc.connect(
-                            f'DRIVER={{{driver}}};'
-                            'SERVER=103.7.181.119;'
-                            'DATABASE=SimplyAmplify;'
-                            'UID=Yashs;'
-                            'PWD=yashshinde$0310$;'
-                            'TrustServerCertificate=yes;'
-                        )
-                        logger.info(f"Successfully connected using {driver}")
-                        return conn
-                    except Exception as odbc_err:
-                        logger.warning(f"Failed to connect with {driver}: {odbc_err}")
-            
-            raise ConnectionError(f"Could not establish database connection with any available drivers: {drivers}")
-        
-    except Exception as e:
-        logger.error(f"Database connection error: {e}")
-        raise ConnectionError(f"Could not establish database connection: {e}")
+        # Retrieve database credentials from environment variables
+        driver = 'ODBC Driver 17 for SQL Server'  # Most compatible driver
+        server = os.getenv('DB_SERVER')
+        database = os.getenv('DB_DATABASE')
+        username = os.getenv('DB_USERNAME')
+        password = os.getenv('DB_PASSWORD')
+
+        # Construct connection string
+        conn_str = (
+            f'DRIVER={{{driver}}};'
+            f'SERVER={server};'
+            f'DATABASE={database};'
+            f'UID={username};'
+            f'PWD={password};'
+        )
+
+        # Attempt connection
+        conn = pyodbc.connect(conn_str)
+        return conn
+    except pyodbc.Error as e:
+        logger.error(f"Database connection error: {str(e)}")
+        # Log available drivers for debugging
+        logger.info("Available ODBC drivers:")
+        for driver in pyodbc.drivers():
+            logger.info(f"  - {driver}")
+        raise
 
 # Login Route
 @app.route('/', methods=['GET', 'POST'])
@@ -74,7 +53,6 @@ def login():
         password = request.form['password']
 
         conn = None
-        cursor = None
         try:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -88,25 +66,24 @@ def login():
                     # Store user ID in session or pass it as a parameter
                     return redirect(url_for('dashboard', user_id=user[0]))
                 else:
-                    # Invalid credentials
-                    return render_template_string(login_page, error='Invalid username or password')
+                    return "Invalid credentials. Please try again."
+            finally:
+                # Ensure connection is closed
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception as close_error:
+                        logger.error(f"Error closing database connection: {str(close_error)}")
 
-            except Exception as query_error:
-                logger.error(f"Login query error: {query_error}")
-                return render_template_string(login_page, error='Database query error')
+        except pyodbc.Error as db_error:
+            # Specific database-related error handling
+            logger.error(f"Database error: {str(db_error)}")
+            return f"Database error: {str(db_error)}", 500
+        except Exception as e:
+            # Catch-all for any other unexpected errors
+            logger.error(f"Unexpected error in login route: {str(e)}", exc_info=True)
+            return f"An unexpected error occurred: {str(e)}", 500
 
-        except ConnectionError as conn_error:
-            logger.error(f"Database connection error: {conn_error}")
-            return render_template_string(login_page, error='Unable to connect to database')
-
-        finally:
-            # Ensure cursor and connection are closed
-            if cursor:
-                cursor.close()
-            if conn:
-                conn.close()
-
-    # GET request: render login page
     return render_template_string(login_page)
 
 # Dashboard (to show after successful login)
@@ -299,36 +276,6 @@ def dashboard():
                     border-radius: 4px;
                     transition: width 0.3s ease;
                 }}
-                .popup-message {{
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    padding: 15px 25px;
-                    border-radius: 5px;
-                    color: white;
-                    font-weight: bold;
-                    z-index: 1000;
-                    display: none;
-                    animation: slideIn 0.5s ease-in-out;
-                }}
-                .popup-success {{
-                    background-color: #4CAF50;
-                    border: 1px solid #45a049;
-                }}
-                .popup-error {{
-                    background-color: #f44336;
-                    border: 1px solid #da190b;
-                }}
-                @keyframes slideIn {{
-                    from {{
-                        transform: translateX(100%);
-                        opacity: 0;
-                    }}
-                    to {{
-                        transform: translateX(0);
-                        opacity: 1;
-                    }}
-                }}
             </style>
         </head>
         <body>
@@ -393,22 +340,7 @@ def dashboard():
                 </form>
             </div>
 
-            <div id="popupMessage" class="popup-message"></div>
-
             <script>
-                // Add this function to show popup messages
-                function showPopup(message, isSuccess) {{
-                    const popup = document.getElementById('popupMessage');
-                    popup.textContent = message;
-                    popup.className = 'popup-message ' + (isSuccess ? 'popup-success' : 'popup-error');
-                    popup.style.display = 'block';
-
-                    // Hide the popup after 3 seconds
-                    setTimeout(() => {{
-                        popup.style.display = 'none';
-                    }}, 3000);
-                }}
-
                 document.getElementById('route').addEventListener('change', function() {{
                     const routeName = this.value;
                     const outletSelect = document.getElementById('outlet');
@@ -430,31 +362,27 @@ def dashboard():
                     }}
                 }});
 
-                // Update the form submission handler
-                document.getElementById('invoiceForm').addEventListener('submit', async function(e) {{
+                document.getElementById('invoiceForm').addEventListener('submit', function(e) {{
                     e.preventDefault();
                     
                     const formData = new FormData(this);
                     
-                    try {{
-                        const response = await fetch('/upload_invoice', {{
-                            method: 'POST',
-                            body: formData
-                        }});
-                        
-                        const result = await response.json();
-                        
-                        if (result.success) {{
-                            showPopup(result.message, true);
-                            // Clear form if needed
+                    fetch('/upload_invoice', {{
+                        method: 'POST',
+                        body: formData
+                    }})
+                    .then(response => response.json())
+                    .then(data => {{
+                        if (data.success) {{
+                            alert('Invoice uploaded successfully!');
                             this.reset();
                         }} else {{
-                            showPopup(result.message, false);
+                            alert('Error uploading invoice: ' + data.message);
                         }}
-                    }} catch (error) {{
-                        showPopup('An error occurred while uploading the invoice', false);
-                        console.error('Error:', error);
-                    }}
+                    }})
+                    .catch(error => {{
+                        alert('Error uploading invoice: ' + error.message);
+                    }});
                 }});
             </script>
         </body>

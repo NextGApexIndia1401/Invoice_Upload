@@ -1,5 +1,6 @@
 flask==3.0.0
-pyodbc==5.0.1; sys_platform != 'linux'
-pymssql==2.2.11
+pyodbc==4.0.39
 azure-storage-blob==12.19.0
-pyodbc
+logging
+gunicorn
+python-dotenv
