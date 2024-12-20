@@ -2,7 +2,6 @@ from flask import Flask, request, redirect, url_for, render_template_string, jso
 import os
 import logging
 from dotenv import load_dotenv
-import pymssql
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -299,6 +298,13 @@ def dashboard():
                         <option value="">Select an outlet</option>
                     </select>
 
+                    <label for="invoice_type">Select Invoice Type:</label>
+                    <select id="invoice_type" name="invoice_type" required>
+                        <option value="">Select an invoice type</option>
+                        <option value="Wholesale">Wholesale</option>
+                        <option value="Display">Display</option>
+                    </select>
+
                     <label for="invoice_date">Invoice Date:</label>
                     <input type="date" id="invoice_date" name="invoice_date" required>
 
@@ -503,9 +509,10 @@ def upload_invoice():
 
         invoice_date = request.form.get('invoice_date')
         invoice_number = request.form.get('invoice_number')
+        invoice_type = request.form.get('invoice_type')
         
         # Log received form data for debugging
-        logger.info(f"Received invoice upload data: user_id={user_id}, outlet_name={outlet_name}, invoice_date={invoice_date}, invoice_number={invoice_number}")
+        logger.info(f"Received invoice upload data: user_id={user_id}, outlet_name={outlet_name}, invoice_date={invoice_date}, invoice_number={invoice_number}, invoice_type={invoice_type}")
 
         # Get quantities for each product
         sensodent_k_fr_75gm = request.form.get('SENSODENT_K_FR_75GM', 0)
@@ -517,9 +524,9 @@ def upload_invoice():
         kidodent_cavity_shield = request.form.get('KIDODENT_CAVITY_SHIELD', 0)
 
         # Validate required fields
-        if not all([user_id, invoice_date, invoice_number, invoice_file]):
+        if not all([user_id, outlet_name, invoice_date, invoice_number, invoice_type, invoice_file]):
             logger.error("Missing required fields for invoice upload")
-            return jsonify({'success': False, 'message': 'Missing required fields'}), 400
+            return jsonify({'success': False, 'message': 'Please fill in all required fields, including Invoice Type'}), 400
 
         # Get outlet code from apOutlet table
         session = get_db_connection()
@@ -534,6 +541,13 @@ def upload_invoice():
             
             outlet_code = outlet_result[0]
             logger.info(f"Found outlet code: {outlet_code} for outlet name: {outlet_name}")
+
+            # Validate invoice type
+            valid_invoice_types = ['Wholesale', 'Display']
+            if invoice_type not in valid_invoice_types:
+                logger.error(f"Invalid invoice type: {invoice_type}")
+                session.close()
+                return jsonify({'success': False, 'message': 'Invalid Invoice Type selected'}), 400
 
             # Generate filename in the format outletcode_date
             current_date = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -553,13 +567,13 @@ def upload_invoice():
                     InvoiceDate, InvoiceNumber, InvoiceDocument,
                     SENSODENT_K_FR_75GM, SENSODENT_KF_CP_75GM, SENSODENT_K_FR_125GM,
                     SENSODENT_KF_CP_125GM, SENSODENT_KF_CP_15G, SENSODENT_K_FR_15G,
-                    KIDODENT_CAVITY_SHIELD
+                    KIDODENT_CAVITY_SHIELD, InvoiceType
                 ) VALUES (
                     :user_id, :outlet_code, :outlet_name, :invoice_available, :display_type,
                     :invoice_date, :invoice_number, :invoice_document,
                     :sensodent_k_fr_75gm, :sensodent_kf_cp_75gm, :sensodent_k_fr_125gm,
                     :sensodent_kf_cp_125gm, :sensodent_kf_cp_15g, :sensodent_k_fr_15g,
-                    :kidodent_cavity_shield
+                    :kidodent_cavity_shield, :invoice_type
                 )
             ''')
 
@@ -579,7 +593,8 @@ def upload_invoice():
                 'sensodent_kf_cp_125gm': sensodent_kf_cp_125gm,
                 'sensodent_kf_cp_15g': sensodent_kf_cp_15g,
                 'sensodent_k_fr_15g': sensodent_k_fr_15g,
-                'kidodent_cavity_shield': kidodent_cavity_shield
+                'kidodent_cavity_shield': kidodent_cavity_shield,
+                'invoice_type': invoice_type
             })
             
             # Commit the transaction

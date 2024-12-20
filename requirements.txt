@@ -1,6 +1,5 @@
 flask==3.0.0
 sqlalchemy==2.0.25
-pymssql==2.2.8
 python-dotenv
 gunicorn
 logging
